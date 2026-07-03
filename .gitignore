@@ -15,3 +15,5 @@ fe-app-netshift/.yarn/
 fe-app-netshift/.yarnrc.yml
 fe-app-netshift/.pnp.*
 agent/
+.claude/
+.opencode/
