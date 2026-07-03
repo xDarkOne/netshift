@@ -3039,6 +3039,35 @@ sing_box_configure_dns() {
     local dns_detour_tag
     dns_detour_tag="$(_get_dns_detour_tag)"
 
+    # DNS-via-outbound routing mode (single|multi|paranoid, default single).
+    # single = LEGACY behaviour: only the main DNS server's .detour is set
+    # (gated by dns_via_outbound=1). byte-identical output -> the dns-off-
+    # byte-parity gate still passes. multi/paranoid extend sing-box into a
+    # recursive-aware DNS proxy (task-047): any DNS query that reached the
+    # dns-in inbound (127.0.0.42:53) from a LAN client and asks an arbitrary
+    # upstream (1.1.1.1, dns.google, ...) is matched by the appended inbound-
+    # route rule and forwarded through the chosen proxy outbound -> the
+    # upstream is contacted from inside the tunnel. The rule lives on
+    # .route.rules[] with the transient __service_tag (stripped on save) so
+    # run-time behaviour matches the spec without polluting user-visible
+    # route rules. Single is the safe default; failing-open is intentional —
+    # when dns_detour_tag is empty the rule is not appended and DNS falls
+    # through to the directly-resolving dns-server (same behaviour as today).
+    local dns_outbound_mode
+    config_get dns_outbound_mode "settings" "dns_outbound_mode" "single"
+    case "$dns_outbound_mode" in
+    multi | paranoid)
+        if [ -n "$dns_detour_tag" ]; then
+            config=$(sing_box_cm_add_route_rule "$config" "$SB_DNS_INBOUND_ROUTING_TAG" "$SB_DNS_INBOUND_TAG" "$dns_detour_tag")
+        else
+            log "DNS-via-outbound mode '$dns_outbound_mode' is active but no outbound is available; staying direct (fail-open)" "warn"
+        fi
+        ;;
+    *)
+        log "Unknown dns_outbound_mode '$dns_outbound_mode'; falling back to 'single' (no DNS-in route rule)" "warn"
+        ;;
+    esac
+
     config=$(sing_box_cm_add_udp_dns_server "$config" "$SB_BOOTSTRAP_SERVER_TAG" "$bootstrap_dns_server" 53)
     config=$(sing_box_cf_add_dns_server "$config" "$dns_type" "$SB_DNS_SERVER_TAG" "$dns_server" "$dns_domain_resolver" "$dns_detour_tag")
     if netshift_ipv6_enabled; then

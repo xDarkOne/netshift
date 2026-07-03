@@ -129,6 +129,14 @@ SB_FAKEIP_INET6_RANGE="fd00:ec3a::/32"
 SB_BOOTSTRAP_SERVER_TAG="bootstrap-dns-server"
 SB_FAKEIP_DNS_RULE_TAG="fakeip-dns-rule-tag"
 SB_INVERT_FAKEIP_DNS_RULE_TAG="invert-fakeip-dns-rule-tag"
+# Internal-tag for the inbound-aware DNS route rule appended when
+# settings.dns_outbound_mode ∈ {multi,paranoid} (task-047). It routes every
+# query that landed on the dns-in inbound through the chosen proxy outbound
+# (recursive-aware multi-resolver proxy). The rule carries the transient
+# SERVICE_TAG (__service_tag) so it is stripped by
+# sing_box_cm_save_config_to_file -> not visible in the saved config, but
+# stable across runs so debugging+logging remains straightforward.
+SB_DNS_INBOUND_ROUTING_TAG="dns-inbound-routing-rule-tag"
 # Inbounds
 SB_TPROXY_INBOUND_TAG="tproxy-in"
 SB_TPROXY_INBOUND_ADDRESS="127.0.0.1"

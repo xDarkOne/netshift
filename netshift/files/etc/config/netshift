@@ -15,6 +15,17 @@ config settings 'settings'
         option download_lists_via_proxy '0'
         #option dns_via_outbound '0'
         #option dns_outbound_section 'main'
+        # DNS-via-outbound routing mode (single|multi|paranoid, default single).
+        # single: legacy behaviour — only the main DNS server (SB_DNS_SERVER_TAG)
+        # carries a .detour key; bootstrap/fakeip stay direct. Omitting the
+        # option is byte-identical to 'single' (no regression).
+        # multi / paranoid: in addition to the .detour on the main server, a
+        # dns.rules[] entry with action=route, inbound=[dns-in] (127.0.0.42:53),
+        # outbound=<vpn-tag> is appended so any client query that reached
+        # sing-box via the dns-in inbound is forwarded through the chosen
+        # proxy outbound (recursive-aware multi-resolver proxy). single stays
+        # the safe default for byte-parity with task-014.
+        #option dns_outbound_mode 'single'
         option dont_touch_dhcp '0'
         option config_path '/etc/sing-box/config.json'
         option cache_path '/tmp/sing-box/cache.db'
