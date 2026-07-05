@@ -17,3 +17,4 @@ fe-app-netshift/.pnp.*
 agent/
 .claude/
 .opencode/
+.pr-review/
