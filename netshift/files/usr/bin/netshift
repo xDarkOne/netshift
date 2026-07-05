@@ -881,23 +881,46 @@ get_sing_box_cache_path() {
     printf '%s' "$cache_path"
 }
 
+# Resolve the overlay backup path for the configured live cache DB. The backup
+# file lives next to the live path's *basename* so that a user who overrode
+# UCI `settings.cache_path` (e.g. moved it to /etc/sing-box/cache.db) doesn't
+# end up with a backup that disagrees with the live location. For the default
+# live path (/tmp/sing-box/cache.db) we keep the legacy location
+# ($NETSHIFT_STATE_DIR/cache.db) so the choice saved by any 0.9.3 setup is
+# restored on upgrade — both forward- and backward-compatible.
+get_sing_box_cache_backup_path() {
+    local cache_path live_basename
+    cache_path="$(get_sing_box_cache_path)"
+    [ -n "$cache_path" ] || { printf '%s' "$NETSHIFT_CACHE_BACKUP"; return 0; }
+    live_basename="$(basename "$cache_path")"
+    # Default live path -> keep legacy backup location for 0.9.3 migration.
+    if [ "$cache_path" = "/tmp/sing-box/cache.db" ]; then
+        printf '%s' "$NETSHIFT_CACHE_BACKUP"
+        return 0
+    fi
+    # Custom live path -> backup next to it on overlay, keyed by basename.
+    printf '%s/%s' "$NETSHIFT_STATE_DIR" "$live_basename"
+}
+
 # Restore the overlay snapshot into the live (tmpfs) location BEFORE sing-box
 # starts. Only when the live DB is ABSENT (a reboot wiped tmpfs) and a snapshot
 # exists — never clobber a live DB that already holds fresher in-RAM state (the
 # reload/restart path, where tmpfs survived).
 restore_sing_box_cache() {
-    local cache_path cache_dir
+    local cache_path cache_dir backup_path
     cache_path="$(get_sing_box_cache_path)"
     [ -n "$cache_path" ] || return 0
     [ -e "$cache_path" ] && return 0
-    [ -f "$NETSHIFT_CACHE_BACKUP" ] || return 0
+
+    backup_path="$(get_sing_box_cache_backup_path)"
+    [ -f "$backup_path" ] || return 0
 
     cache_dir="$(dirname "$cache_path")"
     mkdir -p "$cache_dir" 2>/dev/null
-    if cp "$NETSHIFT_CACHE_BACKUP" "$cache_path" 2>/dev/null; then
-        log "Restored sing-box cache from $NETSHIFT_CACHE_BACKUP (selected server preserved across reboot)" "info"
+    if cp "$backup_path" "$cache_path" 2>/dev/null; then
+        log "Restored sing-box cache from $backup_path (selected server preserved across reboot)" "info"
     else
-        log "Failed to restore sing-box cache from $NETSHIFT_CACHE_BACKUP" "warn"
+        log "Failed to restore sing-box cache from $backup_path" "warn"
     fi
 }
 
@@ -905,27 +928,73 @@ restore_sing_box_cache() {
 # never leaves a truncated snapshot). No-op until the live DB exists. Called on a
 # clean stop and after a successful selection change. Writes to flash are rare
 # (stop + explicit user selection), never on FakeIP churn.
+#
+# flock($NETSHIFT_CACHE_BACKUP_LOCK) guards against two concurrent PATCHes in
+# clash_api racing on the same cp+mv: each wrote its own .tmp.$$ (different
+# PIDs) and then mv'd — mv is atomic so the final state was always one or the
+# other, but two redundant cp+mv cycles landed on the flash. Serialising the
+# whole snapshot under the lock removes the wasted write and ensures the
+# second caller, finding the cache byte-identical via cmp-guard, short-circuits.
 backup_sing_box_cache() {
-    local cache_path tmp
+    local cache_path tmp backup_path lock_path backup_dir
+
     cache_path="$(get_sing_box_cache_path)"
     [ -n "$cache_path" ] && [ -f "$cache_path" ] || return 0
 
-    # Skip the flash write when the snapshot is already byte-identical (a reload
-    # / WAN-flap that changed neither the selection nor the FakeIP state) so the
-    # overlay is written only on a real change, not on every reload.
-    if [ -f "$NETSHIFT_CACHE_BACKUP" ] && cmp -s "$cache_path" "$NETSHIFT_CACHE_BACKUP"; then
-        return 0
+    backup_path="$(get_sing_box_cache_backup_path)"
+    [ -n "$backup_path" ] || return 0
+
+    # Ensure the parent dir of the snapshot/lock exists. We resolve the dir
+    # from the backup_path itself rather than $NETSHIFT_STATE_DIR so a stale
+    # constants.sh (missing NETSHIFT_CACHE_BACKUP_LOCK) cannot leave us with
+    # an empty redirect target that ash rejects with "can't create :
+    # nonexistent directory". The parent of backup_path IS the snapshot dir
+    # by construction in get_sing_box_cache_backup_path().
+    backup_dir="$(dirname "$backup_path")"
+    mkdir -p "$backup_dir" 2>/dev/null
+    [ -d "$backup_dir" ] || return 0
+
+    # Lock file. ALWAYS derived from backup_path so it tracks the snapshot
+    # location automatically (critical for tests that override NETSHIFT_STATE_DIR
+    # to a scratch dir). NETSHIFT_CACHE_BACKUP_LOCK from constants.sh is
+    # accepted when it is set AND its dirname matches the snapshot dir; this
+    # preserves the documented constant as a configurability hook while making
+    # the function independent of a stale constants.sh (the original
+    # `can't create : nonexistent directory` regression). A path mismatch is
+    # logged once so the operator can sync the constants — but does NOT abort.
+    lock_path="${NETSHIFT_CACHE_BACKUP_LOCK:-}"
+    if [ -z "$lock_path" ] || [ "$(dirname "$lock_path")" != "$backup_dir" ]; then
+        if [ -n "$lock_path" ] && [ "$(dirname "$lock_path")" != "$backup_dir" ]; then
+            log "NETSHIFT_CACHE_BACKUP_LOCK=$lock_path lives outside $backup_dir; using per-snapshot lock instead" "warn"
+        elif [ -z "$lock_path" ]; then
+            log "NETSHIFT_CACHE_BACKUP_LOCK is unset; using per-snapshot lock (constants.sh may be stale)" "warn"
+        fi
+        lock_path="${backup_path}.lock"
     fi
 
-    mkdir -p "$NETSHIFT_STATE_DIR" 2>/dev/null
-    tmp="${NETSHIFT_CACHE_BACKUP}.tmp.$$"
-    if cp "$cache_path" "$tmp" 2>/dev/null && mv "$tmp" "$NETSHIFT_CACHE_BACKUP" 2>/dev/null; then
-        chmod 600 "$NETSHIFT_CACHE_BACKUP" 2>/dev/null
-        log "Backed up sing-box cache to $NETSHIFT_CACHE_BACKUP" "debug"
-    else
-        rm -f "$tmp" 2>/dev/null
-        log "Failed to back up sing-box cache to $NETSHIFT_CACHE_BACKUP" "warn"
-    fi
+    # Open the lock FD on FD 9 so the sub-shell can't see it (busybox flock is
+    # not always reliable across a `command -v >/dev/null && exec 9>…` dance
+    # in ash); a clean ( … 9>"$LOCK" … ) sub-shell scopes the lock to the
+    # critical section and always releases it on exit.
+    (
+        flock 9
+        # Skip the flash write when the snapshot is already byte-identical (a
+        # reload / WAN-flap that changed neither the selection nor the FakeIP
+        # state) so the overlay is written only on a real change, not on every
+        # reload.
+        if [ -f "$backup_path" ] && cmp -s "$cache_path" "$backup_path"; then
+            exit 0
+        fi
+
+        tmp="${backup_path}.tmp.$$"
+        if cp "$cache_path" "$tmp" 2>/dev/null && mv "$tmp" "$backup_path" 2>/dev/null; then
+            chmod 600 "$backup_path" 2>/dev/null
+            log "Backed up sing-box cache to $backup_path" "debug"
+        else
+            rm -f "$tmp" 2>/dev/null
+            log "Failed to back up sing-box cache to $backup_path" "warn"
+        fi
+    ) 9>"$lock_path"
 }
 
 start_main() {
@@ -3089,6 +3158,61 @@ sing_box_configure_dns() {
     config=$(sing_box_cm_patch_dns_route_rule "$config" "$SB_FAKEIP_DNS_RULE_TAG" "domain" "$service_domains")
 }
 
+# Auto-detect the active WAN device for sing-box's `route.default_interface`.
+# Used only when UCI `settings.output_network_interface` is empty. The earlier
+# implementation hard-coded `network.interface.wan` (which breaks on multi-WAN
+# setups with mwan3 / renamed interfaces like `internet` / `wwan`, and which
+# can return empty during early boot before ubus has the interface up, forcing
+# the i/o-timeout `auto_detect_interface: true` fallback).
+#
+# Resolution order (first non-empty wins):
+#   1. The device behind the kernel's default route (cheapest, race-safe on
+#      reboot: ip route is up before ubus carries interface state).
+#   2. The first `UPTIME`-aware interface in ubus, scanned by a name
+#      preference list — wan, wan6, wwan, internet, wan2, ... — so renamed
+#      and multi-WAN setups (mwan3 members) all resolve to a concrete device.
+#   3. Fall back to the legacy single-interface probe (`network.interface.wan`)
+#      so 0.8.x setups keep their previously-detected device exactly when ubus
+#      happens to know it. This branch is intentionally last so the more
+#      general strategies above win by default.
+#   4. Print empty — caller falls back to `auto_detect_interface: true`.
+#
+# Always returns a single non-empty device string OR an empty string.
+detect_wan_device() {
+    # ── 1. Default-route device (reboot-safe; race-free vs. ubus) ────────────
+    local default_dev
+    default_dev="$(ip route show default 2>/dev/null | awk '/^default/{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')"
+    if [ -n "$default_dev" ]; then
+        echo "$default_dev"
+        return 0
+    fi
+
+    # ── 2. ubus by preferred name (multi-WAN / renamed setups) ───────────────
+    local iface dev
+    for iface in wan wan6 wwan internet wan2 wan3 wan4 wan5; do
+        dev="$(ubus call "network.interface.${iface}" status 2>/dev/null \
+            | jq -r '(.device // empty), (.l3_device // empty)' 2>/dev/null \
+            | awk 'NF && !seen[$0]++ {print; exit}')"
+        if [ -n "$dev" ]; then
+            echo "$dev"
+            return 0
+        fi
+    done
+
+    # ── 3. Legacy single-interface probe (last; preserves 0.8.x behaviour
+    #       when nothing in steps 1-2 matched but ubus knows the literal
+    #       `network.interface.wan`) ──────────────────────────────────────────
+    dev="$(ubus call "network.interface.wan" status 2>/dev/null \
+        | jq -r '.device // empty' 2>/dev/null)"
+    if [ -n "$dev" ]; then
+        echo "$dev"
+        return 0
+    fi
+
+    # ── 4. No candidate → caller falls back to auto_detect_interface ─────────
+    return 0
+}
+
 sing_box_configure_route() {
     log "Configure the route section of a sing-box JSON configuration"
 
@@ -3126,7 +3250,7 @@ sing_box_configure_route() {
     config_get output_network_interface "settings" "output_network_interface"
     if [ -z "$output_network_interface" ]; then
         local _wan_device
-        _wan_device=$(ubus call network.interface.wan status 2>/dev/null | jq -r '.device // empty' 2>/dev/null)
+        _wan_device="$(detect_wan_device)"
         if [ -n "$_wan_device" ]; then
             log "Auto-detected WAN device for sing-box: $_wan_device" "info"
             config=$(sing_box_cm_configure_route "$config" "$route_final" false "$SB_DNS_SERVER_TAG" \

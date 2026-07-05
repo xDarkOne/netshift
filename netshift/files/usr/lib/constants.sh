@@ -14,6 +14,7 @@ NETSHIFT_STATE_DIR="/etc/netshift"
 # survive a reboot WITHOUT paying flash writes on every FakeIP allocation (which
 # is exactly why the live DB deliberately stays in tmpfs).
 NETSHIFT_CACHE_BACKUP="$NETSHIFT_STATE_DIR/cache.db"
+NETSHIFT_CACHE_BACKUP_LOCK="$NETSHIFT_STATE_DIR/cache.db.lock"
 RESOLV_CONF="/etc/resolv.conf"
 DNS_RESOLVERS="1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 9.9.9.11 94.140.14.14 94.140.15.15 208.67.220.220 208.67.222.222 77.88.8.1 77.88.8.8"
 CHECK_PROXY_IP_DOMAIN="ip.podkop.fyi"
