@@ -1586,17 +1586,42 @@ rm -rf "$VE_BIN" "$VE_CALLS"
 SB_VER=""
 get_sing_box_version() { echo "$SB_VER"; }
 
-# ── (0b) is_valid_vless_encryption follows the sing-box-extended parser ─────
+# ── (0b) is_valid_vless_encryption accepts what the extended core accepts ──
+# (parseClientEncryption + ClientInstance.Init; checked against the real core
+# below when one is available). Keys are 43 (X25519) or 1579 (ML-KEM-768)
+# base64url characters; padding "N-N-N" only before the first key.
 K='U8FmnIZILXq_jbMEEiPCkNENtc8sTHgADfkO5zB6_E4'
-for v in "$KEY" "mlkem768x25519plus.xorpub.1rtt.$K" "mlkem768x25519plus.random.0rtt.100-111-1111.75-0-111.$K.$K"; do
-    is_valid_vless_encryption "$v" && echo "ve-valid-accepts-$v:OK" || echo "ve-valid-accepts-$v:FAIL"
+BIG_OK="$(awk 'BEGIN { while (i++ < 1579) printf "A" }')"
+BIG_BAD="$(awk 'BEGIN { while (i++ < 1579) printf "_" }')"
+for v in "$KEY" "mlkem768x25519plus.xorpub.1rtt.$K" "mlkem768x25519plus.random.0rtt.$K.$K" \
+    "mlkem768x25519plus.native.0rtt.100-35-35.$K" "mlkem768x25519plus.native.0rtt.100-35-35.1-2-3.$K" \
+    "mlkem768x25519plus.native.1rtt.$BIG_OK" "mlkem768x25519plus.native.1rtt.$BIG_OK.$K"; do
+    short="$(printf '%s' "$v" | cut -c1-90)"
+    is_valid_vless_encryption "$v" && echo "ve-valid-accepts-[$short]:OK" || echo "ve-valid-accepts-[$short]:FAIL"
 done
+K42="$(printf '%s' "$K" | cut -c1-42)"
+K41="$(printf '%s' "$K" | cut -c1-41)"
 for v in "" "none" "mlkem768x25519plus.native.0rtt" "mlkem768x25519plus.native.0rtt." \
+    "mlkem768x25519plus.native.0rtt.A" "mlkem768x25519plus.native.0rtt.AAAA" \
+    "mlkem768x25519plus.native.0rtt.$K42" "mlkem768x25519plus.native.0rtt.$K41" \
+    "mlkem768x25519plus.native.0rtt.${K}A" \
     "mlkem768.native.0rtt.$K" "mlkem768x25519plus.fast.0rtt.$K" "mlkem768x25519plus.native.2rtt.$K" \
-    "mlkem768x25519plus.native.0rtt.$K..$K" "mlkem768x25519plus.native.0rtt.AB CD" \
+    "mlkem768x25519plus.native.0rtt.$K..$K" "mlkem768x25519plus.native.0rtt.$K.100-35-35" \
+    "mlkem768x25519plus.native.0rtt.100-111-1111.$K" "mlkem768x25519plus.native.0rtt.100-34-35.$K" \
+    "mlkem768x25519plus.native.0rtt.12345.$K" "mlkem768x25519plus.native.1rtt.$BIG_BAD" \
+    "mlkem768x25519plus.native.0rtt.AB CD" \
     "mlkem768x25519plus.native.0rtt.AB+CD" "mlkem768x25519plus.native.0rtt.AB%2BCD"; do
-    is_valid_vless_encryption "$v" && echo "ve-valid-rejects-[$v]:FAIL" || echo "ve-valid-rejects-[$v]:OK"
+    short="$(printf '%s' "$v" | cut -c1-90)"
+    is_valid_vless_encryption "$v" && echo "ve-valid-rejects-[$short]:FAIL" || echo "ve-valid-rejects-[$short]:OK"
 done
+
+# ── (0c) the encryption value is read as a URI component: '+' survives ──────
+# (This is what tells the component decoder from the form decoder; a facade
+# level test cannot, since '+' and ' ' are both rejected by the validator.)
+v="$(url_get_query_param_component 'vless://u@h:1?encryption=a+b%2Bc&type=tcp' encryption)"
+[ "$v" = 'a+b+c' ] && echo 've-param-component-plus:OK' || echo "ve-param-component-plus:FAIL ($v)"
+v="$(url_get_query_param 'vless://u@h:1?encryption=a+b&type=tcp' encryption)"
+[ "$v" = 'a b' ] && echo 've-param-form-plus-is-space:OK' || echo "ve-param-form-plus-is-space:FAIL ($v)"
 
 # ── (1) the release after "-extended-" decides, not the upstream version ────
 for v in 1.13.14-extended-2.5.0 1.13.18-extended-2.6.5 1.12.22-extended-2.0.0 1.12.22-extended-2.0.0-rc.1; do
@@ -1623,6 +1648,22 @@ out_bare=$(sing_box_cf_add_proxy_outbound "$base" "bare" "$BARE" "0")
 printf '%s' "$out_bare" | jq -e '.outbounds[0] | has("encryption") | not' >/dev/null 2>&1 \
     && echo 've-ext-absent-omitted:OK' || echo 've-ext-absent-omitted:FAIL'
 
+# A value that is not a VLESS Encryption handshake ("auto", "None") keeps the
+# pre-PR behaviour — plain VLESS — but is no longer silent.
+for other in auto None; do
+    : > "$LOG_FILE"
+    out_other=$(sing_box_cf_add_proxy_outbound "$base" "other" \
+        "vless://66666666-7777-8888-9999-aaaaaaaaaaaa@plain.example.com:443?encryption=$other&type=tcp&security=tls&sni=plain.example.com" "0")
+    rc=$?
+    if [ "$rc" = "0" ] &&
+        printf '%s' "$out_other" | jq -e '(.outbounds | length) == 1 and (.outbounds[0] | has("encryption") | not)' >/dev/null 2>&1 &&
+        grep -q "^warn|Section 'other': unknown VLESS encryption value '$other'" "$LOG_FILE"; then
+        echo "ve-other-value-plain-with-warning-[$other]:OK"
+    else
+        echo "ve-other-value-plain-with-warning-[$other]:FAIL (rc=$rc)"
+    fi
+done
+
 # The value is decoded as a URI component: percent-escapes are undone, a
 # literal '+' stays '+' (never a space) and is then rejected as malformed —
 # the link is skipped with an error instead of failing `sing-box check` for
@@ -1639,7 +1680,7 @@ for raw in 'mlkem768x25519plus.native.0rtt.AAAA+BBBB' 'mlkem768x25519plus.native
         "vless://11111111-2222-3333-4444-555555555555@pq.example.com:28872?encryption=$raw&type=tcp&security=none" "0")
     rc=$?
     if [ "$rc" != "0" ] && [ "$out_bad" = "$base" ] &&
-        grep -q '^error|VLESS Encryption value of this link is malformed' "$LOG_FILE"; then
+        grep -q '^error|Section .*VLESS Encryption key of this link is malformed' "$LOG_FILE"; then
         echo "ve-ext-malformed-skipped-[$raw]:OK"
     else
         echo "ve-ext-malformed-skipped-[$raw]:FAIL (rc=$rc)"
@@ -1654,7 +1695,7 @@ rc=$?
 [ "$rc" != "0" ] && echo 've-stock-pq-skip-rc:OK' || echo 've-stock-pq-skip-rc:FAIL (rc=0)'
 [ "$out_st" = "$base" ] && echo 've-stock-pq-config-unchanged:OK' \
     || echo "ve-stock-pq-config-unchanged:FAIL ($out_st)"
-grep -q '^error|VLESS Encryption requires sing-box-extended' "$LOG_FILE" \
+grep -q '^error|Section .*VLESS Encryption requires sing-box-extended' "$LOG_FILE" \
     && echo 've-stock-pq-logged:OK' || echo 've-stock-pq-logged:FAIL'
 out_st_plain=$(sing_box_cf_add_proxy_outbound "$base" "plain" "$PLAIN" "0")
 rc=$?
@@ -1706,16 +1747,30 @@ $PQ" "0" "URLTest"
     && echo 've-stock-pq-only-no-members:OK' \
     || echo "ve-stock-pq-only-no-members:FAIL ($_member_outbound_tags)"
 
-# urltest on extended keeps both members; a real check is only meaningful when
-# the container core itself carries the field.
+# urltest on extended keeps both members, and a real extended core accepts the
+# config with the field.
 SB_VER="1.13.14-extended-2.5.0"
 config="$base"
 _build_proxy_member_outbounds "vx" "$PQ
 $PLAIN" "0" "URLTest"
 [ "$_member_outbound_tags" = "vx-1-out,vx-2-out" ] && echo 've-ext-members-both:OK' \
     || echo "ve-ext-members-both:FAIL ($_member_outbound_tags)"
-real_ver="$(sing-box version 2>/dev/null | head -n1 | awk '{print $NF}')"
-if [ -n "$real_ver" ] && is_sing_box_extended_at_least "2.0.0" "$real_ver"; then
+# A real core that carries the field: the image ships a pinned
+# /usr/local/bin/sing-box-extended next to the stock sing-box; otherwise use
+# the container core itself if it happens to be extended.
+ve_core_ver() {
+    "$1" version 2>/dev/null | head -n1 | awk '
+        { for (i = 1; i < NF; i++) if ($i == "version") { print $(i + 1); exit } print $NF }'
+}
+ext_core=""
+for c in /usr/local/bin/sing-box-extended "$(command -v sing-box 2>/dev/null)"; do
+    [ -n "$c" ] && [ -x "$c" ] || continue
+    if is_sing_box_extended_at_least "$SB_EXTENDED_VLESS_ENCRYPTION_MIN" "$(ve_core_ver "$c")"; then
+        ext_core="$c"
+        break
+    fi
+done
+if [ -n "$ext_core" ]; then
     printf '%s' "$config" | jq --arg m "$_member_outbound_tags" '{
         log: { level: "error" },
         inbounds: [],
@@ -1724,10 +1779,44 @@ if [ -n "$real_ver" ] && is_sing_box_extended_at_least "2.0.0" "$real_ver"; then
             { type: "direct", tag: "direct-out" } ]),
         route: { final: "vx-urltest" }
     }' > "$ve_full" 2>/dev/null
-    sing-box -c "$ve_full" check > /dev/null 2>&1 \
+    "$ext_core" -c "$ve_full" check > /dev/null 2>&1 \
         && echo 've-ext-urltest-check:OK' || echo 've-ext-urltest-check:FAIL'
+
+    # The validator accepts exactly what the core accepts: truncated keys,
+    # padding after a key, Xray-style padding (it decodes, so the fork takes it
+    # for a 9-byte key), ML-KEM keys with valid / out-of-range coefficients.
+    big_ok="$(awk 'BEGIN { while (i++ < 1579) printf "A" }')"
+    big_bad="$(awk 'BEGIN { while (i++ < 1579) printf "_" }')"
+    for v in "$KEY" "mlkem768x25519plus.native.0rtt.$(printf '%s' "$K" | cut -c1-42)" \
+        "mlkem768x25519plus.native.0rtt.$(printf '%s' "$K" | cut -c1-41)" \
+        "mlkem768x25519plus.native.0rtt.A" "mlkem768x25519plus.native.0rtt.100-35-35.$K" \
+        "mlkem768x25519plus.native.0rtt.$K.100-35-35" "mlkem768x25519plus.native.0rtt.100-111-1111.$K" \
+        "mlkem768x25519plus.xorpub.1rtt.$big_ok" "mlkem768x25519plus.xorpub.1rtt.$big_bad"; do
+        jq -n --arg e "$v" '{ log: { level: "error" }, outbounds: [ { type: "vless", tag: "t",
+            server: "x.example.com", server_port: 1,
+            uuid: "11111111-2222-3333-4444-555555555555", encryption: $e } ] }' > "$ve_full"
+        "$ext_core" -c "$ve_full" check > /dev/null 2>&1 && core=accept || core=reject
+        is_valid_vless_encryption "$v" && mine=accept || mine=reject
+        short="$(printf '%s' "$v" | cut -c1-60)"
+        [ "$mine" = "$core" ] && echo "ve-validator-matches-core-[$short]:OK" \
+            || echo "ve-validator-matches-core-[$short]:FAIL (validator=$mine core=$core)"
+    done
 else
     echo 've-ext-urltest-check:SKIP'
+fi
+
+# The gate is needed at all: a stock core rejects the whole config once the
+# field is in it.
+stock_core="$(command -v sing-box 2>/dev/null)"
+if [ -n "$stock_core" ] && ! is_sing_box_extended "$(ve_core_ver "$stock_core")"; then
+    jq -n --arg e "$KEY" '{ log: { level: "error" }, outbounds: [ { type: "vless", tag: "t",
+        server: "x.example.com", server_port: 1,
+        uuid: "11111111-2222-3333-4444-555555555555", encryption: $e } ] }' > "$ve_full"
+    "$stock_core" -c "$ve_full" check > /dev/null 2>&1 \
+        && echo 've-stock-core-rejects-field:FAIL (stock core accepted encryption)' \
+        || echo 've-stock-core-rejects-field:OK'
+else
+    echo 've-stock-core-rejects-field:SKIP'
 fi
 rm -f "$ve_full"
 
@@ -1783,7 +1872,7 @@ esac
 : > "$LOG_FILE"
 sing_box_cf_add_proxy_outbound "$base" "xbad" "$bad_line" "0" > /dev/null 2>&1
 rc=$?
-if [ "$rc" != "0" ] && grep -q '^error|VLESS Encryption value of this link is malformed' "$LOG_FILE"; then
+if [ "$rc" != "0" ] && grep -q '^error|Section .*VLESS Encryption key of this link is malformed' "$LOG_FILE"; then
     echo 've-xray-bad-key-rejected-loudly:OK'
 else
     echo "ve-xray-bad-key-rejected-loudly:FAIL (rc=$rc)"
