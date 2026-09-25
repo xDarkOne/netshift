@@ -271,11 +271,31 @@ url_get_query_param() {
     local param="$2"
 
     local raw
-    raw=$(echo "$url" | sed -n "s/.*[?&]$param=\([^&?#]*\).*/\1/p")
+    raw=$(_url_get_query_param_raw "$url" "$param")
 
     [ -z "$raw" ] && echo "" && return
 
     url_decode "$raw"
+}
+
+# Like url_get_query_param, but decodes the value as a URI component: a literal
+# '+' stays '+' instead of becoming a space. For opaque tokens such as keys,
+# where '+' is data and a space would silently corrupt the value.
+url_get_query_param_component() {
+    local url="$1"
+    local param="$2"
+
+    local raw
+    raw=$(_url_get_query_param_raw "$url" "$param")
+
+    [ -z "$raw" ] && echo "" && return
+
+    url_decode_component "$raw"
+}
+
+# Returns the still-encoded value of a query parameter from a RAW link.
+_url_get_query_param_raw() {
+    echo "$1" | sed -n "s/.*[?&]$2=\([^&?#]*\).*/\1/p"
 }
 
 # Extracts the basename (filename without extension) from a URL
@@ -809,10 +829,27 @@ get_kernel_version() {
 }
 
 # Returns the sing-box version number (e.g. "1.12.0")
+#
+# A loop that asks for the version once per link can resolve it once instead:
+#   local NETSHIFT_SING_BOX_VERSION
+#   NETSHIFT_SING_BOX_VERSION="$(get_sing_box_version)"
+# Everything it calls, command-substitution subshells included, then reuses
+# the value rather than spawning `sing-box version` again; `local` keeps it
+# from outliving the loop (a sing-box upgrade must be seen by the next run).
 get_sing_box_version() {
+    if [ -n "${NETSHIFT_SING_BOX_VERSION:-}" ]; then
+        echo "$NETSHIFT_SING_BOX_VERSION"
+        return
+    fi
+
     local version=""
     if command -v sing-box >/dev/null 2>&1; then
-        version="$(sing-box version 2>/dev/null | head -n1 | awk '{print $NF}')"
+        # "sing-box version 1.13.14-extended-2.5.0": take the word after
+        # "version", so a build that appends more words to the line still
+        # reports its version; fall back to the last word.
+        version="$(sing-box version 2>/dev/null | head -n1 | awk '
+            { for (i = 1; i < NF; i++) if ($i == "version") { print $(i + 1); exit }
+              print $NF }')"
     fi
     echo "${version:-1.0}"
 }
@@ -838,18 +875,54 @@ is_sing_box_extended() {
 # release, and fields are added there independently of the upstream version in
 # front of it (v1.13.11-extended-1.6.2 exists and still lacks VLESS
 # Encryption, which arrived in extended-2.0.0). Stock cores always fail.
-# Pre-releases of the required release pass: "2.0.0-rc.1" sorts after "2.0.0".
+# Only the release part of that suffix is compared: `sort -V` would rank
+# "2.0.0-rc.1" above "2.0.0", the reverse of semver, so the pre-release tag is
+# dropped instead. Pre-releases of the required release therefore pass, and
+# that is deliberate here: VLESS Encryption already ships in 2.0.0-rc.1.
 # Arguments:
 #   $1 - minimum extended release (e.g. "2.0.0")
 #   $2 - optional sing-box version string (defaults to get_sing_box_version)
 is_sing_box_extended_at_least() {
     local required="$1"
     local version="${2:-}"
+    local release
 
     [ -n "$version" ] || version="$(get_sing_box_version)"
 
     is_sing_box_extended "$version" || return 1
-    is_min_package_version "${version##*-extended-}" "$required"
+    release="${version##*-extended-}"
+    is_min_package_version "${release%%-*}" "$required"
+}
+
+# Returns 0 if the value is a VLESS Encryption client string that
+# sing-box-extended can parse: "mlkem768x25519plus.<native|xorpub|random>.
+# <0rtt|1rtt>." followed by optional padding segments and base64url keys.
+# Only [A-Za-z0-9._-] is ever valid there, so a '+' turned into a space, a
+# stray '%' or a cut-off value is caught here instead of failing
+# `sing-box check` — and with it the whole config — later on.
+# Arguments:
+#   $1 - encryption value from a vless:// link
+is_valid_vless_encryption() {
+    local value="$1"
+    local rest
+
+    case "$value" in
+    '' | *[!A-Za-z0-9._-]* | *..* | *.) return 1 ;;
+    esac
+
+    rest="${value#mlkem768x25519plus.}"
+    [ "$rest" != "$value" ] || return 1
+
+    case "$rest" in
+    native.* | xorpub.* | random.*) ;;
+    *) return 1 ;;
+    esac
+    rest="${rest#*.}"
+
+    case "$rest" in
+    0rtt.?* | 1rtt.?*) return 0 ;;
+    esac
+    return 1
 }
 
 # Generates a deterministic HWID based on WAN MAC address and device model
@@ -1311,7 +1384,9 @@ describe_subscription_validation_failure() {
 # CRITICAL: OpenWRT's jq has no Oniguruma, so the program below uses only
 # explicit string operations (no test/match/sub/gsub). It also keeps every
 # query VALUE free of '& ? # %' and whitespace, because url_get_query_param()
-# (helpers.sh) stops a value at the first such delimiter.
+# (helpers.sh) stops a value at the first such delimiter. The one exception is
+# the vless `encryption` key, which is percent-encoded (@uri) instead, so it is
+# never lost.
 #
 # Arguments:
 #   src_file: path to the raw downloaded subscription body
@@ -1394,10 +1469,14 @@ xray_json_to_uri_lines() {
               if $ob.protocol == "vless" then
                 # VLESS Encryption keys (mlkem768x25519plus...) live in the
                 # user entry; carry them over so the facade can emit them.
-                # Plain VLESS has "none" there or no field at all.
+                # Plain VLESS has "none" there or no field at all. Unlike the
+                # other params the value is percent-encoded rather than
+                # dropped by safe(): dropping it would silently turn a PQ node
+                # into plain VLESS. The facade decodes it as a URI component
+                # and rejects a malformed key loudly.
                 ([ ("encryption="
-                    + (safe($user.encryption)
-                       | if . == "" then "none" else . end)),
+                    + (($user.encryption // "") | tostring
+                       | if . == "" then "none" else @uri end)),
                    ("type=" + $net),
                    kv("flow"; $user.flow),
                    (if $sec != "" then ("security=" + $sec) else empty end),
@@ -1627,6 +1706,12 @@ normalize_subscription_to_singbox() {
     # consume subsequent lines. A file redirect keeps the loop's stdin isolated.
     lines_file="$(mktemp 2>/dev/null)" || lines_file="/tmp/netshift-sub-fb.$$"
     printf '%s\n' "$candidate" > "$lines_file"
+
+    # Resolve the core version once for the whole feed: the builder checks it
+    # per link (e.g. VLESS Encryption), and each check would otherwise spawn
+    # `sing-box version` again. See get_sing_box_version.
+    local NETSHIFT_SING_BOX_VERSION
+    NETSHIFT_SING_BOX_VERSION="$(get_sing_box_version)"
 
     while IFS= read -r line; do
         # Trim leading/trailing whitespace.

@@ -124,21 +124,32 @@ sing_box_cf_add_proxy_outbound() {
         packet_encoding=$(url_get_query_param "$url" "packetEncoding")
         # VLESS Encryption: the mlkem768x25519plus... handshake travels in
         # the encryption= param. Ordinary links carry "none" there, which
-        # the manager drops, so nothing changes for them.
-        encryption=$(url_get_query_param "$url" "encryption")
+        # the manager drops, so nothing changes for them. The value is a key,
+        # not form text: decode it as a URI component so a '+' is not turned
+        # into a space.
+        encryption=$(url_get_query_param_component "$url" "encryption")
 
-        # `encryption` is a sing-box-extended field (extended-2.0.0 and newer);
-        # stock sing-box and older extended builds decode configs strictly, so
-        # emitting it there would fail `sing-box check` for the WHOLE config.
-        # Skip only this link instead, with the same contract as the `*)` arm:
-        # config echoed UNCHANGED, non-zero return. The url/selector/urltest
-        # callers add a member tag only on success, so no group ever references
-        # an outbound that was not created. Ordinary links are not gated.
-        if [ -n "$encryption" ] && [ "$encryption" != "none" ] &&
-            ! is_sing_box_extended_at_least "2.0.0"; then
-            log "VLESS Encryption requires sing-box-extended 2.0.0 or newer. Install sing-box-extended and retry." "error"
-            echo "$config"
-            return 1
+        # Both checks below skip only this link, with the same contract as the
+        # `*)` arm: config echoed UNCHANGED, non-zero return. The url/selector/
+        # urltest callers add a member tag only on success, so no group ever
+        # references an outbound that was not created. Ordinary links are not
+        # affected.
+        if [ -n "$encryption" ] && [ "$encryption" != "none" ]; then
+            # A malformed value would make sing-box-extended reject the
+            # outbound and `sing-box check` fail for the WHOLE config.
+            if ! is_valid_vless_encryption "$encryption"; then
+                log "VLESS Encryption value of this link is malformed (expected mlkem768x25519plus.<mode>.<rtt>. followed by base64url keys); skipping the link." "error"
+                echo "$config"
+                return 1
+            fi
+            # `encryption` is a sing-box-extended field (extended-2.0.0 and
+            # newer); stock sing-box and older extended builds decode configs
+            # strictly and would fail `sing-box check` for the WHOLE config.
+            if ! is_sing_box_extended_at_least "2.0.0"; then
+                log "VLESS Encryption requires sing-box-extended 2.0.0 or newer. Install sing-box-extended and retry." "error"
+                echo "$config"
+                return 1
+            fi
         fi
 
         config=$(sing_box_cm_add_vless_outbound "$config" "$tag" "$host" "$port" "$uuid" "$flow" "" "$packet_encoding" "$encryption")
