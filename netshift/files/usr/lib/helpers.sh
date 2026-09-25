@@ -874,7 +874,8 @@ is_sing_box_extended() {
 # "1.13.14-extended-2.5.0": the part after "-extended-" is the fork's own
 # release, and fields are added there independently of the upstream version in
 # front of it (v1.13.11-extended-1.6.2 exists and still lacks VLESS
-# Encryption, which arrived in extended-2.0.0). Stock cores always fail.
+# Encryption, which arrived in extended-2.0.0, see
+# SB_EXTENDED_VLESS_ENCRYPTION_MIN). Stock cores always fail.
 # Only the release part of that suffix is compared: `sort -V` would rank
 # "2.0.0-rc.1" above "2.0.0", the reverse of semver, so the pre-release tag is
 # dropped instead. Pre-releases of the required release therefore pass, and
@@ -895,17 +896,25 @@ is_sing_box_extended_at_least() {
 }
 
 # Returns 0 if the value is a VLESS Encryption client string that
-# sing-box-extended can parse: "mlkem768x25519plus.<native|xorpub|random>.
-# <0rtt|1rtt>." followed by optional padding segments and base64url keys.
-# Only [A-Za-z0-9._-] is ever valid there, so a '+' turned into a space, a
-# stray '%' or a cut-off value is caught here instead of failing
-# `sing-box check` — and with it the whole config — later on.
+# sing-box-extended accepts, i.e. passes both parseClientEncryption and
+# ClientInstance.Init in the fork:
+#   "mlkem768x25519plus.<native|xorpub|random>.<0rtt|1rtt>." then segments;
+#   a segment that base64url-decodes must be a key of exactly 32 bytes
+#   (X25519, any value) or 1184 bytes (ML-KEM-768: every 12-bit coefficient
+#   below q = 3329); one that does not decode is padding "N-N-N", allowed only
+#   before the first key, with the limits of ParsePadding; at least one key.
+# A value this accepts is one the core accepts too, so a '+' turned into a
+# space, a stray '%', a key cut short by one character or a corrupted key is
+# caught here instead of failing `sing-box check` — and with it the whole
+# config — later on. No od/hexdump on device: base64 is decoded in awk.
 # Arguments:
 #   $1 - encryption value from a vless:// link
 is_valid_vless_encryption() {
     local value="$1"
     local rest
 
+    # Only [A-Za-z0-9._-] ever occurs: keys are base64.RawURLEncoding and the
+    # parts are joined by dots. No empty part either.
     case "$value" in
     '' | *[!A-Za-z0-9._-]* | *..* | *.) return 1 ;;
     esac
@@ -920,9 +929,58 @@ is_valid_vless_encryption() {
     rest="${rest#*.}"
 
     case "$rest" in
-    0rtt.?* | 1rtt.?*) return 0 ;;
+    0rtt.?* | 1rtt.?*) ;;
+    *) return 1 ;;
     esac
-    return 1
+    rest="${rest#*.}"
+
+    # Within [A-Za-z0-9_-] unpadded base64url fails to decode only when the
+    # length is 1 mod 4; otherwise it decodes into floor(3*len/4) bytes, and
+    # 32 / 1184 bytes are exactly 43 / 1579 characters.
+    printf '%s\n' "$rest" | awk -F. '
+        function b64(c) {
+            return index("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", c) - 1
+        }
+        # Go crypto/mlkem: the first 1152 bytes (1536 characters) pack 768
+        # 12-bit coefficients, two per 3 bytes, each of which must be < 3329.
+        function mlkem_ok(s,    i, x0, x1, x2, x3, b0, b1, b2) {
+            for (i = 1; i <= 1536; i += 4) {
+                x0 = b64(substr(s, i, 1)); x1 = b64(substr(s, i + 1, 1))
+                x2 = b64(substr(s, i + 2, 1)); x3 = b64(substr(s, i + 3, 1))
+                b0 = x0 * 4 + int(x1 / 16)
+                b1 = (x1 % 16) * 16 + int(x2 / 4)
+                b2 = (x2 % 4) * 64 + x3
+                if (b0 + (b1 % 16) * 256 >= 3329) return 0
+                if (int(b1 / 16) + b2 * 16 >= 3329) return 0
+            }
+            return 1
+        }
+        # ParsePadding: "len-min-max" (more parts are ignored), the first one
+        # at least 100-35-35, the sum of max(min, max) over the even ones at
+        # most 18 + 65535.
+        function padding_ok(s, idx,    n, x, k) {
+            n = split(s, x, "-")
+            if (n < 3) return 0
+            for (k = 1; k <= 3; k++)
+                if (x[k] !~ /^[0-9]+$/ || length(x[k]) > 18) return 0
+            if (idx == 0 && (x[1] + 0 < 100 || x[2] + 0 < 35 || x[3] + 0 < 35)) return 0
+            if (idx % 2 == 0) total += (x[2] + 0 > x[3] + 0) ? x[2] + 0 : x[3] + 0
+            return 1
+        }
+        {
+            keys = 0; pads = 0; total = 0
+            for (f = 1; f <= NF; f++) {
+                len = length($f)
+                if (len % 4 == 1) {
+                    if (keys > 0 || !padding_ok($f, pads)) exit 1
+                    pads++
+                    continue
+                }
+                if (len == 43 || (len == 1579 && mlkem_ok($f))) { keys++; continue }
+                exit 1
+            }
+            exit (keys > 0 && total <= 18 + 65535) ? 0 : 1
+        }'
 }
 
 # Generates a deterministic HWID based on WAN MAC address and device model
