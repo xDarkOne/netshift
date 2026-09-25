@@ -1481,9 +1481,17 @@ USEOF
 # that was not created. Ordinary links (encryption=none or absent) are never
 # gated and their JSON is unchanged.
 #
-# Drives the REAL gate through get_sing_box_version, the REAL facade/manager/
-# helpers and the SHIPPED _build_proxy_member_outbounds (awk-extracted). All
-# values are synthetic placeholders.
+# The value itself is checked too: it is decoded as a URI component (a '+'
+# stays '+') and must match what the extended parser accepts, so a key mangled
+# into a space or carrying a '%' skips the link with an error rather than
+# failing `sing-box check` for the whole config. Xray-JSON feeds keep such a
+# key (percent-encoded) instead of silently downgrading it to "none". The core
+# version is resolved once per feed / member list, not once per PQ link.
+#
+# Drives the REAL gate through get_sing_box_version (first through a stub
+# `sing-box` on PATH, then through a version override), the REAL facade/
+# manager/helpers and the SHIPPED _build_proxy_member_outbounds (awk-extracted).
+# All values are synthetic placeholders.
 test_vless_encryption() {
     header "VLESS Encryption passthrough + extended gate"
 
@@ -1512,17 +1520,83 @@ log()     { printf '%s|%s\n' "${2:-info}" "$1" >> "$LOG_FILE"; }
 echolog() { printf '%s|%s\n' "${2:-info}" "$1" >> "$LOG_FILE"; }
 nolog()   { :; }
 
-# Drive the real gate through the version string it reads.
-SB_VER=""
-get_sing_box_version() { echo "$SB_VER"; }
-
 eval "$(awk '/^_build_proxy_member_outbounds\(\) \{/{p=1} p{print} p&&/^\}/{exit}' "BIN_PATH")"
 
 base='{"outbounds":[]}'
-KEY='mlkem768x25519plus.native.0rtt.AAAAsyntheticKEYforTEST-_0123'
+KEY='mlkem768x25519plus.native.0rtt.U8FmnIZILXq_jbMEEiPCkNENtc8sTHgADfkO5zB6_E4'
 PQ="vless://11111111-2222-3333-4444-555555555555@pq.example.com:28872?encryption=$KEY&type=tcp&security=none#pq"
 PLAIN="vless://66666666-7777-8888-9999-aaaaaaaaaaaa@plain.example.com:443?encryption=none&type=tcp&security=tls&sni=plain.example.com#plain"
 BARE="vless://66666666-7777-8888-9999-aaaaaaaaaaaa@plain.example.com:443?type=tcp&security=tls&sni=plain.example.com#bare"
+
+# ── (0) the REAL get_sing_box_version, through a stub `sing-box` on PATH ─────
+# The stub prints $VE_SB_LINE for `version` and counts those calls; anything
+# else (e.g. `check`) succeeds silently.
+VE_BIN="/tmp/ve-bin-$$"
+VE_CALLS="/tmp/ve-calls-$$"
+mkdir -p "$VE_BIN"
+: > "$VE_CALLS"
+cat > "$VE_BIN/sing-box" << STUB
+#!/bin/sh
+if [ "\$1" = "version" ]; then
+    echo x >> "$VE_CALLS"
+    printf '%s\n' "\$VE_SB_LINE"
+fi
+exit 0
+STUB
+chmod +x "$VE_BIN/sing-box"
+ve_saved_path="$PATH"
+PATH="$VE_BIN:$PATH"
+export VE_SB_LINE
+
+VE_SB_LINE="sing-box version 1.13.14-extended-2.5.0"
+v="$(get_sing_box_version)"
+[ "$v" = "1.13.14-extended-2.5.0" ] && echo 've-version-parse:OK' || echo "ve-version-parse:FAIL ($v)"
+# A build that appends more words must not lose the version (and the feature).
+VE_SB_LINE="sing-box version 1.13.14-extended-2.5.0 (go1.23.4, linux/arm64)"
+v="$(get_sing_box_version)"
+[ "$v" = "1.13.14-extended-2.5.0" ] && echo 've-version-parse-suffix:OK' || echo "ve-version-parse-suffix:FAIL ($v)"
+
+# One `sing-box version` per feed / per member list, not one per PQ link.
+VE_SB_LINE="sing-box version 1.13.14-extended-2.5.0"
+ve_sub="/tmp/ve-sub-$$"
+ve_subout="/tmp/ve-subout-$$"
+: > "$ve_sub"
+i=1
+while [ $i -le 5 ]; do
+    printf 'vless://11111111-2222-3333-4444-55555555555%s@pq%s.example.com:28872?encryption=%s&type=tcp&security=none#pq%s\n' \
+        "$i" "$i" "$KEY" "$i" >> "$ve_sub"
+    i=$((i + 1))
+done
+: > "$VE_CALLS"
+normalize_subscription_to_singbox "$ve_sub" "$ve_subout" "vc" > /dev/null 2>&1
+n=$(jq '[.outbounds[] | select(has("encryption"))] | length' "$ve_subout" 2>/dev/null)
+calls=$(wc -l < "$VE_CALLS" | tr -d ' ')
+[ "$n" = "5" ] && echo 've-cache-sub-outbounds:OK' || echo "ve-cache-sub-outbounds:FAIL (n=$n)"
+[ "$calls" = "1" ] && echo 've-cache-sub-one-call:OK' || echo "ve-cache-sub-one-call:FAIL (calls=$calls)"
+: > "$VE_CALLS"
+config="$base"
+_build_proxy_member_outbounds "vm" "$(sed 's/#.*//' "$ve_sub")" "0" "URLTest"
+calls=$(wc -l < "$VE_CALLS" | tr -d ' ')
+[ "$calls" = "1" ] && echo 've-cache-members-one-call:OK' || echo "ve-cache-members-one-call:FAIL (calls=$calls)"
+rm -f "$ve_sub" "$ve_subout"
+PATH="$ve_saved_path"
+rm -rf "$VE_BIN" "$VE_CALLS"
+
+# From here on drive the gate through the version string it reads.
+SB_VER=""
+get_sing_box_version() { echo "$SB_VER"; }
+
+# ── (0b) is_valid_vless_encryption follows the sing-box-extended parser ─────
+K='U8FmnIZILXq_jbMEEiPCkNENtc8sTHgADfkO5zB6_E4'
+for v in "$KEY" "mlkem768x25519plus.xorpub.1rtt.$K" "mlkem768x25519plus.random.0rtt.100-111-1111.75-0-111.$K.$K"; do
+    is_valid_vless_encryption "$v" && echo "ve-valid-accepts-$v:OK" || echo "ve-valid-accepts-$v:FAIL"
+done
+for v in "" "none" "mlkem768x25519plus.native.0rtt" "mlkem768x25519plus.native.0rtt." \
+    "mlkem768.native.0rtt.$K" "mlkem768x25519plus.fast.0rtt.$K" "mlkem768x25519plus.native.2rtt.$K" \
+    "mlkem768x25519plus.native.0rtt.$K..$K" "mlkem768x25519plus.native.0rtt.AB CD" \
+    "mlkem768x25519plus.native.0rtt.AB+CD" "mlkem768x25519plus.native.0rtt.AB%2BCD"; do
+    is_valid_vless_encryption "$v" && echo "ve-valid-rejects-[$v]:FAIL" || echo "ve-valid-rejects-[$v]:OK"
+done
 
 # ── (1) the release after "-extended-" decides, not the upstream version ────
 for v in 1.13.14-extended-2.5.0 1.13.18-extended-2.6.5 1.12.22-extended-2.0.0 1.12.22-extended-2.0.0-rc.1; do
@@ -1548,6 +1622,29 @@ printf '%s' "$out_plain" | jq -e '.outbounds[0] | has("encryption") | not' >/dev
 out_bare=$(sing_box_cf_add_proxy_outbound "$base" "bare" "$BARE" "0")
 printf '%s' "$out_bare" | jq -e '.outbounds[0] | has("encryption") | not' >/dev/null 2>&1 \
     && echo 've-ext-absent-omitted:OK' || echo 've-ext-absent-omitted:FAIL'
+
+# The value is decoded as a URI component: percent-escapes are undone, a
+# literal '+' stays '+' (never a space) and is then rejected as malformed —
+# the link is skipped with an error instead of failing `sing-box check` for
+# the whole config.
+ENC_DOTS='mlkem768x25519plus%2Enative%2E0rtt%2EU8FmnIZILXq_jbMEEiPCkNENtc8sTHgADfkO5zB6_E4'
+out_dots=$(sing_box_cf_add_proxy_outbound "$base" "dots" \
+    "vless://11111111-2222-3333-4444-555555555555@pq.example.com:28872?encryption=$ENC_DOTS&type=tcp&security=none" "0")
+printf '%s' "$out_dots" | jq -e --arg k "$KEY" '.outbounds[0].encryption == $k' >/dev/null 2>&1 \
+    && echo 've-ext-percent-decoded:OK' || echo 've-ext-percent-decoded:FAIL'
+for raw in 'mlkem768x25519plus.native.0rtt.AAAA+BBBB' 'mlkem768x25519plus.native.0rtt.AAAA%2BBBBB' \
+    'mlkem768x25519plus.native.0rtt.AAAA%25BBBB' 'mlkem768x25519plus.native'; do
+    : > "$LOG_FILE"
+    out_bad=$(sing_box_cf_add_proxy_outbound "$base" "bad" \
+        "vless://11111111-2222-3333-4444-555555555555@pq.example.com:28872?encryption=$raw&type=tcp&security=none" "0")
+    rc=$?
+    if [ "$rc" != "0" ] && [ "$out_bad" = "$base" ] &&
+        grep -q '^error|VLESS Encryption value of this link is malformed' "$LOG_FILE"; then
+        echo "ve-ext-malformed-skipped-[$raw]:OK"
+    else
+        echo "ve-ext-malformed-skipped-[$raw]:FAIL (rc=$rc)"
+    fi
+done
 
 # ── (3) stock: the PQ link is skipped, ordinary links are untouched ─────────
 SB_VER="1.13.14"
@@ -1598,6 +1695,16 @@ if command -v sing-box > /dev/null 2>&1; then
 else
     echo 've-stock-urltest-check:SKIP'
 fi
+
+# A list made only of PQ links on stock: no member at all and the config left
+# untouched, so the caller marks the section unavailable (reject rule) instead
+# of emitting an empty group.
+config="$base"
+_build_proxy_member_outbounds "vo" "$PQ
+$PQ" "0" "URLTest"
+[ -z "$_member_outbound_tags" ] && [ "$config" = "$base" ] \
+    && echo 've-stock-pq-only-no-members:OK' \
+    || echo "ve-stock-pq-only-no-members:FAIL ($_member_outbound_tags)"
 
 # urltest on extended keeps both members; a real check is only meaningful when
 # the container core itself carries the field.
@@ -1654,6 +1761,33 @@ SB_VER="1.13.14-extended-2.5.0"
 rt=$(sing_box_cf_add_proxy_outbound "$base" "rt" "$pq_line" "0")
 printf '%s' "$rt" | jq -e --arg k "$KEY" '.outbounds[0].encryption == $k' >/dev/null 2>&1 \
     && echo 've-xray-roundtrip:OK' || echo 've-xray-roundtrip:FAIL'
+rm -f "$xsrc"
+
+# A key with '%' or '+' is not dropped to "none" (that would silently turn the
+# PQ node into plain VLESS): it is percent-encoded into the URI, and the facade
+# then rejects it loudly as malformed.
+cat > "$xsrc" << XJSON
+{ "outbounds": [
+  { "protocol": "vless", "tag": "xbad",
+    "settings": { "vnext": [ { "address": "xbad.example.com", "port": 28872,
+      "users": [ { "id": "11111111-2222-3333-4444-555555555555",
+                   "encryption": "mlkem768x25519plus.native.0rtt.AA%B+C" } ] } ] },
+    "streamSettings": { "network": "tcp", "security": "none" } }
+] }
+XJSON
+bad_line="$(xray_json_to_uri_lines "$xsrc" 2>/dev/null)"
+case "$bad_line" in
+*"encryption=mlkem768x25519plus.native.0rtt.AA%25B%2BC"*) echo 've-xray-bad-key-kept:OK' ;;
+*) echo "ve-xray-bad-key-kept:FAIL ($bad_line)" ;;
+esac
+: > "$LOG_FILE"
+sing_box_cf_add_proxy_outbound "$base" "xbad" "$bad_line" "0" > /dev/null 2>&1
+rc=$?
+if [ "$rc" != "0" ] && grep -q '^error|VLESS Encryption value of this link is malformed' "$LOG_FILE"; then
+    echo 've-xray-bad-key-rejected-loudly:OK'
+else
+    echo "ve-xray-bad-key-rejected-loudly:FAIL (rc=$rc)"
+fi
 rm -f "$xsrc"
 
 rm -f "$LOG_FILE"
